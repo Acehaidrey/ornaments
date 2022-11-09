@@ -48,16 +48,51 @@ def format_inventory_received(csv_file_path):
 
 def compare_invoice_count_to_our_count(our_count_path, invoice_path):
     with open(our_count_path) as our_csv_file, open(invoice_path) as invoice_csv_file:
-        our_csv_reader = csv.reader(our_csv_file, delimiter=',')
-        invoice_csv_reader = csv.reader(invoice_csv_file, delimiter=',')
+        our_csv_reader = csv.DictReader(our_csv_file)
+        invoice_csv_reader = csv.DictReader(invoice_csv_file)
         our_dict, invoice_dict = defaultdict(lambda: 0), defaultdict(lambda: 0)
         for row in our_csv_reader:
-            our_dict[row[0]] = int(row[1])
+            our_dict[row['Ornament_Name']] = int(row['Box_Count'])
         for row in invoice_csv_reader:
-            invoice_dict[row[0]] = int(row[1])
+            invoice_dict[row['Number']] = int(row['Qty Ordered'].strip().strip('ea'))
         # get overlap
         # get missing dates
         # build csv with the problematic records comparison
+        print(our_dict)
+        print(invoice_dict)
+        keys_only_ours = our_dict.keys() - invoice_dict.keys()
+        keys_only_theirs = invoice_dict.keys() - our_dict.keys()
+        keys_overlapped = invoice_dict.keys() & our_dict.keys()
+        print(sorted(list(keys_only_ours)))
+        print(sorted(list(keys_only_theirs)))
+        print(sorted(list(keys_overlapped)))
+        print('-----')
+        remove_prefix = {i.strip('OR').strip('PF') for i in keys_only_ours}.intersection({i.strip('OR').strip('PF') for i in keys_only_theirs})
+        print(remove_prefix)
+        print('-------')
+        output_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'COMPARE_ORNAMENTS.csv')
+        with open(output_path, 'w+', newline='\n') as out_csvfile:
+            csv_writer = csv.DictWriter(out_csvfile, fieldnames=['Item Name', 'Invoice Count', 'True Count', 'Diff'])
+            csv_writer.writeheader()
+            for key in keys_overlapped:
+                d = {
+                    'Item Name': key,
+                    'Invoice Count': invoice_dict[key],
+                    'True Count': our_dict[key],
+                    'Diff': our_dict[key] - invoice_dict[key]
+                }
+                csv_writer.writerow(d)
+                print(d)
+            for key in keys_only_theirs:
+                d = {
+                    'Item Name': key,
+                    'Invoice Count': invoice_dict[key],
+                    'True Count': 0,
+                    'Diff': our_dict[key] - invoice_dict[key]
+                }
+                csv_writer.writerow(d)
+                print(d)
+
 
 
 def add_item_prefix(item_id):
@@ -200,11 +235,183 @@ def rename_items_in_catalog(catalog_path, invoice_path):
     return output_path
 
 
+def get_square_client():
+    app_id = ''
+    token = ''
+    from square.client import Client
+
+    client = Client(access_token=token, environment='production')
+    return client
+
+
+def get_all_catalog_items():
+    token = ''
+    from square.client import Client
+
+    client = Client(access_token=token, environment='production')
+    all_items = []
+    cursor = 'start'
+    while cursor:
+        if cursor == 'start':
+            cursor = None
+        raw_return = client.catalog.list_catalog(types='ITEM', cursor=cursor)
+        items = raw_return.body['objects']
+        all_items.extend(items)
+        cursor = raw_return.body['cursor'] if 'cursor' in raw_return.body.keys() else None
+        print(f'Added {len(items)} items. Cursor is: {cursor}')
+    print(f'Total number of items found {len(all_items)}')
+    return all_items
+
+
+def get_all_catalog_items_missing_images():
+    token = ''
+    from square.client import Client
+
+    client = Client(access_token=token, environment='production')
+    all_items = []
+    cursor = 'start'
+    while cursor:
+        if cursor == 'start':
+            cursor = None
+        raw_return = client.catalog.list_catalog(types='ITEM', cursor=cursor)
+        items = raw_return.body['objects']
+        items_missing_images = [i for i in items if not i['item_data'].get('image_ids', None)] # ['item_data']['name']
+        all_items.extend(items_missing_images)
+        cursor = raw_return.body['cursor'] if 'cursor' in raw_return.body.keys() else None
+        print(f'Added {len(items)} items. Cursor is: {cursor}')
+    print(f'Total number of items found {len(all_items)} missing any images.')
+    return all_items
+
+
+def get_all_items_in_given_year(items, year_filter=2022):
+    items = items or get_all_catalog_items()
+
+    from datetime import datetime
+
+    recent_items = []
+    for item in items:
+        created_at = item['created_at']
+        try:
+            created_at_dt = datetime.strptime(created_at, '%Y-%m-%dT%H:%M:%S.%fZ')
+        except ValueError:
+            created_at_dt = datetime.strptime(created_at, '%Y-%m-%dT%H:%M:%SZ')
+        yr = created_at_dt.year
+        if yr == year_filter:
+            recent_items.append(item)
+    print(f'Total number of items found {len(recent_items)}')
+    return recent_items
+
+
+def update_photos_of_items():
+    token = ''
+    from square.client import Client
+    import os, time
+
+    fiver_photo_downloaded_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'Ornaments2022')
+    client = Client(access_token=token, environment='production')
+
+    found_items = []
+    for f in os.listdir(fiver_photo_downloaded_path):
+        image_id = f.strip('.jpg')
+        req = client.catalog.search_catalog_items(body={"text_filter": image_id}).body
+        try:
+            items = req['items']
+            print(f'For id {image_id} found {len(items)} items in catalog')
+        except KeyError:
+            print(f'ERROR: No results for {image_id}')
+            items = []
+        for item in items:
+            item_id = item['id']
+            item_name = item['item_data']['name']
+            short_item_name = item_name.split(' ')[-1].strip('(').strip(')')
+            found_items.extend(short_item_name)
+            print(image_id, item_id, item_name, short_item_name)
+            result = client.catalog.create_catalog_image(
+                request={
+                    "idempotency_key": str(time.time()),
+                    "object_id": item_id,
+                    "image": {
+                        "type": "IMAGE",
+                        "id": f"#{short_item_name}",
+                        "image_data": {
+                            "caption": item_name
+                        }
+                    }
+                },
+                image_file=open(os.path.join(fiver_photo_downloaded_path, f), 'rb')
+            )
+            if result.is_error():
+                print(f'ERROR {image_id}, {item_name}, {result.errors}')
+    return found_items
+
+
+def fill_missing_update_photos_of_items():
+    token = ''
+    from square.client import Client
+    import os, time
+
+    fiver_photo_downloaded_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'Ornaments2022')
+    client = Client(access_token=token, environment='production')
+
+    items_missing_images = get_all_catalog_items_missing_images()
+    all_images_in_folder = os.listdir(fiver_photo_downloaded_path)
+    still_missing = []
+    for item in items_missing_images:
+        item_id = item['id']
+        item_name = item['item_data']['name']
+        short_item_name = item_name.split(' ')[-1].strip('(').strip(')')
+        image_id = short_item_name + '.jpg'
+        print(image_id, item_id, item_name, short_item_name)
+        if image_id in all_images_in_folder:
+            result = client.catalog.create_catalog_image(
+                request={
+                    "idempotency_key": str(time.time()),
+                    "object_id": item_id,
+                    "image": {
+                        "type": "IMAGE",
+                        "id": f"#{short_item_name}",
+                        "image_data": {
+                            "caption": item_name
+                        }
+                    }
+                },
+                image_file=open(os.path.join(fiver_photo_downloaded_path, image_id), 'rb')
+            )
+            if result.is_error():
+                print(f'ERROR {image_id}, {item_name}, {result.errors}')
+        else:
+            print(f'ERROR {image_id} not found. {item_name}')
+            still_missing.append(item_name)
+    return still_missing
+
+
 if __name__ == '__main__':
     csv_counted_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'ORNAMENTS_2022.csv')
+    output_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'ORNAMENTS_2022_output.csv')
     invoice_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'SO-61394.csv')
     fiver_photo_downloaded_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'Ornaments2022')
     new_named_catalog = os.path.join(os.path.expanduser('~'), 'Downloads', 'LATEST_CATALOG.csv')
-    # output_path = format_inventory_received(csv_counted_path)
+    # output2300_path = format_inventory_received(csv_counted_path)
     # find_missing_photos(fiver_photo_downloaded_path, invoice_path)
-    rename_items_in_catalog(new_named_catalog, invoice_path)
+    # rename_items_in_catalog(new_named_catalog, invoice_path)
+    # get_all_catalog_items()
+    compare_invoice_count_to_our_count(output_path, invoice_path)
+
+
+# curl https://connect.squareup.com/v2/catalog/images \
+#   -X POST \
+#   -H 'Square-Version: 2022-10-19' \
+#   -H 'Authorization: Bearer '' \
+#   -H 'Accept: application/json' \
+#   -F 'file=@/Users/ahaidrey/Downloads/Ornaments2022/OR2026-4.jpg' \
+#   -F 'request={
+#     "idempotency_key": "OR2026-4",
+#     "object_id": "NUY2THAJA53PAD62FMCIQTJK",
+#     "image": {
+#       "id": "#OR2026-4",
+#       "type": "IMAGE",
+#       "image_data": {
+#         "caption": "FAMILY SERIES - FARM HOUSE FAMILY OF 4 (OR2026-4)"
+#       }
+#     }
+#   }'
